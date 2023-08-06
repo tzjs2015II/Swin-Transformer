@@ -19,6 +19,7 @@ def build_model(config, is_pretrain=False):
     if config.FUSED_LAYERNORM:
         try:
             import apex as amp
+            # 归一化操作,LayerNorm 是一种归一化技术，而 FusedLayerNorm 是使用加速计算的 LayerNorm 实现。
             layernorm = amp.normalization.FusedLayerNorm
         except:
             layernorm = None

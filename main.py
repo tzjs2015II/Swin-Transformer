@@ -87,9 +87,11 @@ def main(config):
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config)
     logger.info(str(model))
-
+    
+    # 计算模型中可训练参数的总数，包括权重和偏置
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"number of params: {n_parameters}")
+    
     if hasattr(model, 'flops'):
         flops = model.flops()
         logger.info(f"number of GFLOPs: {flops / 1e9}")
@@ -98,9 +100,13 @@ def main(config):
     model_without_ddp = model
 
     optimizer = build_optimizer(config, model)
+    
+    # 分布式数据并行方法将模型包装，可以在多个 GPU 上并行训练
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)
+    # 创建一个用于动态精度缩放的损失缩放器，可以提高训练过程中的数值稳定性
     loss_scaler = NativeScalerWithGradNormCount()
 
+    # 根据训练配置信息中的累积步数（梯度累积）来设置学习率调度器（学习率衰减策略）
     if config.TRAIN.ACCUMULATION_STEPS > 1:
         lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train) // config.TRAIN.ACCUMULATION_STEPS)
     else:
@@ -115,7 +121,7 @@ def main(config):
         criterion = torch.nn.CrossEntropyLoss()
 
     max_accuracy = 0.0
-
+    # 自动恢复模型训练
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT)
         if resume_file:
@@ -134,18 +140,21 @@ def main(config):
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
         if config.EVAL_MODE:
             return
-
+    
     if config.MODEL.PRETRAINED and (not config.MODEL.RESUME):
         load_pretrained(config, model_without_ddp, logger)
         acc1, acc5, loss = validate(config, data_loader_val, model)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
-
+        
+    # 吞吐量模式,用于评估模型在给定数据集上的推理速度（inference speed），也称为模型的推理吞吐量。
+    # 通过统计模型的推理时间和输入数据的批次大小，计算模型每秒处理的样本数，从而评估模型的推理性能。
     if config.THROUGHPUT_MODE:
         throughput(data_loader_val, model, logger)
         return
 
     logger.info("Start training")
     start_time = time.time()
+    
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
 
@@ -167,23 +176,27 @@ def main(config):
 
 def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler):
     model.train()
+    # 清空优化器中之前的梯度信息，准备开始当前 epoch 的参数更新
     optimizer.zero_grad()
 
     num_steps = len(data_loader)
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
+    # 梯度范数的平均值
     norm_meter = AverageMeter()
+    # 损失缩放的平均值
     scaler_meter = AverageMeter()
 
     start = time.time()
     end = time.time()
+    
     for idx, (samples, targets) in enumerate(data_loader):
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
-
+        # 使用了 Mixup 数据增强技术，则将数据和标签进行 Mixup
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
-
+        # 启用自动混合精度（Automatic Mixed Precision, AMP），可以加快训练过程
         with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
             outputs = model(samples)
         loss = criterion(outputs, targets)
@@ -191,11 +204,15 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
         # this attribute is added by timm on one optimizer (adahessian)
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+        # 损失缩放器
         grad_norm = loss_scaler(loss, optimizer, clip_grad=config.TRAIN.CLIP_GRAD,
                                 parameters=model.parameters(), create_graph=is_second_order,
                                 update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
+        # 如果累积的 batch 数量达到指定的累积步数，则执行参数更新
         if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
+            #todo 为什么要清空梯度?
             optimizer.zero_grad()
+            # 更新学习率
             lr_scheduler.step_update((epoch * num_steps + idx) // config.TRAIN.ACCUMULATION_STEPS)
         loss_scale_value = loss_scaler.state_dict()["scale"]
 
@@ -306,8 +323,9 @@ if __name__ == '__main__':
     else:
         rank = -1
         world_size = -1
+    #调整训练环境    
     torch.cuda.set_device(config.LOCAL_RANK)
-    torch.distributed.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    torch.distributed.init_process_group(backend='gloo', init_method='env://', world_size=world_size, rank=rank)
     torch.distributed.barrier()
 
     seed = config.SEED + dist.get_rank()
@@ -317,6 +335,8 @@ if __name__ == '__main__':
     random.seed(seed)
     cudnn.benchmark = True
 
+
+    # 线性缩放学习率
     # linear scale the learning rate according to total batch size, may not be optimal
     linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
     linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
@@ -330,6 +350,7 @@ if __name__ == '__main__':
     config.TRAIN.BASE_LR = linear_scaled_lr
     config.TRAIN.WARMUP_LR = linear_scaled_warmup_lr
     config.TRAIN.MIN_LR = linear_scaled_min_lr
+    # 学习率调整后冻结学习率
     config.freeze()
 
     os.makedirs(config.OUTPUT, exist_ok=True)
