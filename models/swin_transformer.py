@@ -457,7 +457,7 @@ class PatchEmbed(nn.Module):
 
         self.in_chans = in_chans
         self.embed_dim = embed_dim
-
+    
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
@@ -469,6 +469,7 @@ class PatchEmbed(nn.Module):
         # FIXME look at relaxing size constraints
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        # 卷积，降低数据维度
         x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
         if self.norm is not None:
             x = self.norm(x)
@@ -598,7 +599,7 @@ class SwinTransformer(nn.Module):
         x = self.avgpool(x.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
         return x
-
+    #todo 开始正向传播的训练过程
     def forward(self, x):
         x = self.forward_features(x)
         x = self.head(x)
