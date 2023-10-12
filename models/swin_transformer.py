@@ -22,14 +22,22 @@ except:
     WindowProcessReverse = None
     print("[Warning] Fused window process have not been installed. Please refer to get_started.md for installation.")
 
-
+# mlp层
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+    #定义了基础的多层感知机
+    def __init__(self, in_features, 
+                 hidden_features=None, 
+                 out_features=None, 
+                 # GELU激活函数 
+                #   act_layer=nn.GELU, 
+                 # todo 替换激活函数,效果测试
+                 act_layer=nn.ReLU(inplace=True),
+                 drop=0.):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
+        self.act = act_layer()# 报错
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
@@ -194,7 +202,9 @@ class SwinTransformerBlock(nn.Module):
 
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                #  act_layer=nn.GELU, 
+                 act_layer=nn.ReLU, #todo 修改就会导致报错,为啥呢
+                 norm_layer=nn.LayerNorm,
                  fused_window_process=False):
         super().__init__()
         self.dim = dim
@@ -245,6 +255,7 @@ class SwinTransformerBlock(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
         self.fused_window_process = fused_window_process
 
+    #为什么在forward里面对模型机构做总理?
     def forward(self, x):
         H, W = self.input_resolution
         B, L, C = x.shape
@@ -311,7 +322,7 @@ class SwinTransformerBlock(nn.Module):
         flops += self.dim * H * W
         return flops
 
-
+# 做了一个线性变化层,维度映射
 class PatchMerging(nn.Module):
     r""" Patch Merging Layer.
 
@@ -360,7 +371,7 @@ class PatchMerging(nn.Module):
         flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
         return flops
 
-
+#todo 基础层,我们可能需要在这里进行激活函数的定义
 class BasicLayer(nn.Module):
     """ A basic Swin Transformer layer for one stage.
 
@@ -393,7 +404,7 @@ class BasicLayer(nn.Module):
         self.depth = depth
         self.use_checkpoint = use_checkpoint
 
-        # build blocks
+        # build blocks 创建多个swin-transformer block
         self.blocks = nn.ModuleList([
             SwinTransformerBlock(dim=dim, input_resolution=input_resolution,
                                  num_heads=num_heads, window_size=window_size,
@@ -433,7 +444,7 @@ class BasicLayer(nn.Module):
             flops += self.downsample.flops()
         return flops
 
-
+# 图像转化为patches 做了一个CNN层做这个事情.
 class PatchEmbed(nn.Module):
     r""" Image to Patch Embedding
 
@@ -458,12 +469,13 @@ class PatchEmbed(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
+        #定义卷积层
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:
             self.norm = None
-
+    
     def forward(self, x):
         B, C, H, W = x.shape
         # FIXME look at relaxing size constraints
@@ -481,7 +493,7 @@ class PatchEmbed(nn.Module):
             flops += Ho * Wo * self.embed_dim
         return flops
 
-
+# todo 核心区域
 class SwinTransformer(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
@@ -509,6 +521,7 @@ class SwinTransformer(nn.Module):
         fused_window_process (bool, optional): If True, use one kernel to fused window shift & window partition for acceleration, similar for the reversed part. Default: False
     """
 
+    # 模型通道数等超参数
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
@@ -525,25 +538,30 @@ class SwinTransformer(nn.Module):
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
         self.mlp_ratio = mlp_ratio
 
-        # split image into non-overlapping patches
+        # split image into non-overlapping patches 图像处理
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
             norm_layer=norm_layer if self.patch_norm else None)
         num_patches = self.patch_embed.num_patches
         patches_resolution = self.patch_embed.patches_resolution
         self.patches_resolution = patches_resolution
+        
+        # 设置完模型参数后,对模型进行训练正则化的设置
 
-        # absolute position embedding
+        # absolute position embedding 绝对位置嵌入
         if self.ape:
+            # 将absolute_pos_embed设置为一个可以梯度更新的参数,并设置基础的张量形状
             self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+            #初始化
             trunc_normal_(self.absolute_pos_embed, std=.02)
 
+        # Dropout 正则化
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        # stochastic depth
+        # stochastic depth 随机深度
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
 
-        # build layers
+        # build layers 
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
@@ -557,6 +575,7 @@ class SwinTransformer(nn.Module):
                                drop=drop_rate, attn_drop=attn_drop_rate,
                                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                                norm_layer=norm_layer,
+                               # 在符合条件的情况下,做一次线性变化
                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                                use_checkpoint=use_checkpoint,
                                fused_window_process=fused_window_process)
@@ -564,6 +583,7 @@ class SwinTransformer(nn.Module):
 
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
+        # 多头注意力机制做一个线性变化
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
         self.apply(self._init_weights)
@@ -576,16 +596,19 @@ class SwinTransformer(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-
+            
+    # todo 可能需要更改的地方,我的想法是可能要把一些QCFS的激活阈值固定,但是具体固定哪些,得先再解析一下        
+    #返回不会衰减的权重字典  
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'absolute_pos_embed'}
-
+    #返回不会被衰减的关键词字典
     @torch.jit.ignore
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
 
     def forward_features(self, x):
+        # 提取图像特征
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed

@@ -28,7 +28,10 @@ from optimizer import build_optimizer
 from logger import create_logger
 from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper, \
     reduce_tensor
+import torch.distributed.launch
 
+from qcfs_transform_module import *
+import logging
 
 def parse_option():
     parser = argparse.ArgumentParser('Swin Transformer training and evaluation script', add_help=False)
@@ -82,10 +85,17 @@ def parse_option():
 
 
 def main(config):
+
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
-    model = build_model(config)
+    model = build_model(config) 
+    
+    # Quantization level of QCFS
+    l_qcfs = 4
+    # 将rule替换qcfs函数
+    replace_activation_by_floor(model,l_qcfs)
+    
     logger.info(str(model))
     
     # 计算模型中可训练参数的总数，包括权重和偏置
@@ -95,7 +105,7 @@ def main(config):
     if hasattr(model, 'flops'):
         flops = model.flops()
         logger.info(f"number of GFLOPs: {flops / 1e9}")
-
+    
     model.cuda()
     model_without_ddp = model
 
@@ -210,7 +220,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                                 update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
         # 如果累积的 batch 数量达到指定的累积步数，则执行参数更新
         if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
-            #todo 为什么要清空梯度?
+           # 清空梯度
             optimizer.zero_grad()
             # 更新学习率
             lr_scheduler.step_update((epoch * num_steps + idx) // config.TRAIN.ACCUMULATION_STEPS)
@@ -311,6 +321,7 @@ def throughput(data_loader, model, logger):
 
 
 if __name__ == '__main__':
+    
     args, config = parse_option()
 
     if config.AMP_OPT_LEVEL:
@@ -325,6 +336,7 @@ if __name__ == '__main__':
         world_size = -1
     #调整训练环境    
     torch.cuda.set_device(config.LOCAL_RANK)
+    # 直接调用分布式组件,通过分布式组件在调用main.py文件实现debug模式的分布式训练
     torch.distributed.init_process_group(backend='gloo', init_method='env://', world_size=world_size, rank=rank)
     torch.distributed.barrier()
 
@@ -366,4 +378,6 @@ if __name__ == '__main__':
     logger.info(config.dump())
     logger.info(json.dumps(vars(args)))
 
+
+    
     main(config)

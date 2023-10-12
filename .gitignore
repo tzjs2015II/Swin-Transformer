@@ -137,3 +137,4 @@ dmypy.json
 .pyre/
 Dataset/imagenet/test/images/test_0.JPEG
 test.py
+distributed
