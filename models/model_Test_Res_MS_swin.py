@@ -1,14 +1,437 @@
-# --------------------------------------------------------
-# Swin Transformer
-# Copyright (c) 2021 Microsoft
-# Licensed under The MIT License [see LICENSE for details]
-# Written by Ze Liu
-# --------------------------------------------------------
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 import torch.utils.checkpoint as checkpoint
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_,PatchEmbed, Mlp, to_ntuple
+
+from typing import Optional
+
+# os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3,4,5,6,7"
+thresh = 0.01  # 0.5 # neuronal threshold 原始要有差距
+thresh_ql = 0.9 # 快捷链接参数
+
+lens = 0.5  # 0.5 # hyper-parameters of approximate function
+decay = 0.25  # 0.25 # decay constants
+num_classes = 10
+time_window = 1
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from einops import rearrange
+
+# define approximate firing function
+
+# SNN 激活函数 
+class ActFun(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input): # 在向前传播的时候剪裁掉小于阈值的浮点值。
+        # 保留此时的张量用于后向传播
+        ctx.save_for_backward(input)
+        # 返回输入中大于thresh[阈值]的浮点值
+        return input.gt(thresh).float()
+
+    @staticmethod
+    def backward(ctx, grad_output): # todo 一些计算细节
+        # 前向传播过程中被保留的张量
+        (input,) = ctx.saved_tensors
+        # print(str(input))
+        # 保存上一层梯度
+        grad_input = grad_output.clone()
+        # 判断输入值减去阈值后是否小于[模拟函数超参数]
+        temp = abs(input - thresh) < lens
+        # 布尔值转化为浮点值，然后进行缩放
+        temp = temp / (2 * lens)
+        
+        # 输入值 * 转换后的布尔值，显然没达到阈值的值会被直接归0，也对应没有达到阈值的脉冲值不会对权重产生影响
+        return grad_input * temp.float()
+
+# SNN 激活函数 
+class ActFun_ql(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input): # 在向前传播的时候剪裁掉小于阈值的浮点值。
+        # 保留此时的张量用于后向传播
+        ctx.save_for_backward(input)
+        # 返回输入中大于thresh[阈值]的浮点值
+        return input.gt(thresh_ql).float()
+
+    @staticmethod
+    def backward(ctx, grad_output): 
+        # 前向传播过程中被保留的张量
+        (input,) = ctx.saved_tensors
+        # 保存上一层梯度
+        grad_input = grad_output.clone()
+        # 判断输入值减去阈值后是否小于[模拟函数超参数]
+        temp = abs(input - thresh_ql) < lens
+        # 布尔值转化为浮点值，然后进行缩放
+        temp = temp / (2 * lens)
+        
+        # 输入值 * 转换后的布尔值，显然没达到阈值的值会被直接归0，也对应没有达到阈值的脉冲值不会对权重产生影响
+        return grad_input * temp.float()
+
+act_fun = ActFun.apply
+# membrane potential update
+
+act_fun_ql = ActFun_ql.apply
+
+# 4 被基础层调用 膜电位更新
+class mem_update(nn.Module):
+    # LIF Layer
+    def __init__(self):
+        super(mem_update, self).__init__()
+
+    # todo 不同的添加thresh的方式 需要不同的设定方式
+    def forward(self, x):
+        # 初始化和输入特征X同大小的全0张量
+        mem = torch.zeros_like(x[0]).to(device) # 此时的处理又把时间切掉了，mem.shape = torch.Size([68, 64, 16, 16])
+        spike = torch.zeros_like(x[0]).to(device)
+        output = torch.zeros_like(x)
+        # 初始为0
+        mem_old = 0
+        # timestep此时固定为1，可能是因为这本身是一个静态图像数据集
+        for i in range(time_window):
+            # 此时time_window固定为1，意味着只会执行一次膜更新
+            if i >= 1:
+                # 当前膜电位 = 之前膜电位 * 衰减系数 * （1-激活值【副本】） + 特征[i]  实质是LIF模型
+                mem = mem_old * decay * (1 - spike.detach()) + x[i]
+            else:
+                #todo 首次执行此处，让men获取x初始的时间切片
+                mem = x[i]
+            # 激活值的被激活函数处理后的膜电位
+            # 
+            spike = act_fun(mem)
+            # 保留之前的膜电位，此时膜电位的更新是以timestep的次数作为标准，因为只循环一次，所以此时mem_old恒定为0
+            mem_old = mem.clone()
+            # 多少timestep，output的数组长度就有多长
+            output[i] = spike
+        return output
+
+# 4 快捷链接膜电位
+class mem_update_ql(nn.Module):
+    # LIF Layer
+    def __init__(self):
+        super(mem_update_ql, self).__init__()
+
+    # todo 不同的添加thresh的方式 需要不同的设定方式
+    def forward(self, x):
+        # 初始化和输入特征X同大小的全0张量
+        mem = torch.zeros_like(x[0]).to(device) # 此时的处理又把时间切掉了，mem.shape = torch.Size([68, 64, 16, 16])
+        spike = torch.zeros_like(x[0]).to(device)
+        output = torch.zeros_like(x)
+        # 初始为0
+        mem_old = 0
+        # timestep此时固定为1，可能是因为这本身是一个静态图像数据集
+        for i in range(time_window):
+            # 此时time_window固定为1，意味着只会执行一次膜更新
+            if i >= 1:
+                # 当前膜电位 = 之前膜电位 * 衰减系数 * （1-激活值【副本】） + 特征[i]  实质是LIF模型
+                mem = mem_old * decay * (1 - spike.detach()) + x[i]
+            else:
+                #todo 首次执行此处，让men获取x初始的时间切片
+                mem = x[i]
+            # 激活值的被激活函数处理后的膜电位
+            # 
+            spike = act_fun_ql(mem)
+            # 保留之前的膜电位，此时膜电位的更新是以timestep的次数作为标准，因为只循环一次，所以此时mem_old恒定为0
+            mem_old = mem.clone()
+            # 多少timestep，output的数组长度就有多长
+            output[i] = spike
+        return output
+
+class Snn_Conv2d(nn.Conv2d):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,# 当设置 dilation 参数时，卷积核中的元素之间会存在一定的间隔，即在计算时跳过一些位置。这可以看作是在卷积核中插入一些零元素，从而调整了卷积核的感受野。
+        groups=1,
+        bias=True,
+        padding_mode="zeros",
+        marker="b",
+    ):
+        super(Snn_Conv2d, self).__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+            padding_mode,
+        )
+        self.marker = marker
+
+    def forward(self, input):
+        weight = self.weight
+        h = (input.size()[3] - self.kernel_size[0] + 2 * self.padding[0]) // self.stride[0] + 1 #通过填充步长与卷积核计算特征图高度与宽度
+        w = (input.size()[4] - self.kernel_size[0] + 2 * self.padding[0]) // self.stride[0] + 1
+        
+        # 创建一个timestep的时间序列，一个五维的全零张量
+        c1 = torch.zeros(
+            time_window,
+            input.size()[1], 
+            self.out_channels, 
+            h, 
+            w, 
+            device=input.device
+        )
+        # 处理一个timestep的时间序列，每一个timestep都进行一次2D卷积,也许可以直接用一个3D卷积代替此处的2D循环卷积
+        for i in range(time_window):
+            c1[i] = F.conv2d(
+                input[i],
+                weight,
+                self.bias,
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.groups,
+            )
+        return c1
+
+# 5 紧随着被基础层调用，在卷积后
+class batch_norm_2d(nn.Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super(batch_norm_2d, self).__init__()
+        self.bn = BatchNorm3d1(
+            # 
+            num_features
+        )  # input (N,C,D,H,W) 进行C-dimension batch norm on (N,D,H,W) slice. spatio-temporal Batch Normalization
+
+    def forward(self, input):
+        y = (
+            input.transpose(0, 2).contiguous().transpose(0, 1).contiguous()
+        )  # 可以使用permute实现？ # y = input.permute(1,2,0).contiguous
+        # y = self.bn(y,4)
+        y = self.bn(y)
+        return (
+            y.contiguous().transpose(0, 1).contiguous().transpose(0, 2)
+        )  # 原始输入是(T,N,C,H,W) BN处理时转变为(N,C,T,H,W)
+        
+# 5_1 被batch_norm_2d调用 
+class BatchNorm3d1(torch.nn.BatchNorm3d):
+    def reset_parameters(self):
+            # 重置运行时统计信息，包括运行时均值和方差等
+        self.reset_running_stats()
+        # BN层是否是可学习的，默认为true，执行
+        if self.affine:
+            # 膜电位 初始化可学习参数 weight
+            nn.init.constant_(self.weight, thresh)
+            # 偏置项清零
+            nn.init.zeros_(self.bias)
+
+# 6 紧随着被基础层调用，在卷积后
+class batch_norm_2d1(nn.Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super(batch_norm_2d1, self).__init__()
+        self.bn = BatchNorm3d2(num_features)
+
+    def forward(self, input):
+        # 将维度0和2进行交换，然后交换后的结果再进行维度0和1的交换。这样就实现了将维度2移到了最前面，而维度0和1的位置互换。
+        y = input.transpose(0, 2).contiguous().transpose(0, 1).contiguous()
+        # y = self.bn(y,4)
+        y = self.bn(y)
+        return y.contiguous().transpose(0, 1).contiguous().transpose(0, 2)
+
+# 6_1 被batch_norm_2d1调用 
+class BatchNorm3d2(torch.nn.BatchNorm3d):
+    def reset_parameters(self):
+        self.reset_running_stats()
+        if self.affine:
+            # 初始化的时候，膜电位乘一个0.2
+            nn.init.constant_(self.weight, 0.2 * thresh)
+            nn.init.zeros_(self.bias)
+
+
+class CSA(nn.Module):
+    def __init__(
+        self, 
+        timeWindows, 
+        channels, 
+        stride=1, 
+        fbs=False, 
+        #  通道注意力模块中的压缩比例（compression ratio）。用于控制通过通道注意力机制后输出通道的数量。
+        c_ratio=16, 
+        t_ratio=1
+    ):
+        super(CSA, self).__init__()
+
+        # CSA层有激活函数
+        self.relu = nn.ReLU(inplace=True)
+
+        self.ca = ChannelAttention(channels, c_ratio)
+        # self.ta = TimeAttention(timeWindows)
+        self.sa = SpatialAttention()
+
+        self.stride = stride
+
+    def forward(self, x):
+        # out = self.ta(x) * x
+        out = self.ca(x) * x  # 广播机制
+        out = self.sa(out) * out  # 广播机制
+
+        out = self.relu(out)
+        return out
+
+# todo 通道注意力(对激活值的权重)
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=5):
+        super(ChannelAttention, self).__init__()
+        # 每个通道平均压缩为1，即为一个像素点 
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.max_pool = nn.AdaptiveMaxPool3d(1)
+
+        self.sharedMLP = nn.Sequential(
+            nn.Conv3d(in_planes, in_planes // ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv3d(in_planes // ratio, in_planes, 1, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = rearrange(x, "b f c h w -> b c f h w")
+        avgout = self.sharedMLP(self.avg_pool(x))
+        maxout = self.sharedMLP(self.max_pool(x))
+        out = self.sigmoid(avgout + maxout)
+        out = rearrange(out, "b c f h w -> b f c h w")
+        return out
+
+# todo 空间注意力
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=3):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), "kernel size must be 3 or 7"
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        c = x.shape[2]
+        x = rearrange(x, "b f c h w -> b (f c) h w")
+        avgout = torch.mean(x, dim=1, keepdim=True)
+        maxout, _ = torch.max(x, dim=1, keepdim=True)
+        # 链接张量
+        x = torch.cat([avgout, maxout], dim=1)
+        x = self.conv(x)
+        x = x.unsqueeze(1)
+
+        return self.sigmoid(x)
+
+
+
+
+
+def get_relative_position_index(win_h, win_w):
+    # get pair-wise relative position index for each token inside the window
+    coords = torch.stack(torch.meshgrid([torch.arange(win_h), torch.arange(win_w)]))  # 2, Wh, Ww
+    coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+    relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+    relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+    relative_coords[:, :, 0] += win_h - 1  # shift to start from 0
+    relative_coords[:, :, 1] += win_w - 1
+    relative_coords[:, :, 0] *= 2 * win_w - 1
+    return relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+
+class WindowAttention(nn.Module):
+    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
+    It supports both of shifted and non-shifted window.
+    Args:
+        dim (int): Number of input channels.
+        num_heads (int): Number of attention heads.
+        head_dim (int): Number of channels per head (dim // num_heads if not set)
+        window_size (tuple[int]): The height and width of the window.
+        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
+        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+    """
+
+    def __init__(self, dim, num_heads, head_dim=None, window_size=7, qkv_bias=True, attn_drop=0., proj_drop=0.):
+
+        super().__init__()
+        self.dim = dim
+        self.window_size = to_2tuple(window_size)  # Wh, Ww
+        win_h, win_w = self.window_size
+        self.window_area = win_h * win_w
+        self.num_heads = num_heads
+        head_dim = head_dim or dim // num_heads
+        attn_dim = head_dim * num_heads
+        self.scale = head_dim ** -0.5
+
+        # define a parameter table of relative position bias, shape: 2*Wh-1 * 2*Ww-1, nH
+        self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * win_h - 1) * (2 * win_w - 1), num_heads))
+
+        # get pair-wise relative position index for each token inside the window
+        self.register_buffer("relative_position_index", get_relative_position_index(win_h, win_w))
+
+        self.qkv = nn.Linear(dim, attn_dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(attn_dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def _get_rel_pos_bias(self) -> torch.Tensor:
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)].view(self.window_area, self.window_area, -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        return relative_position_bias.unsqueeze(0)
+
+    def forward(self, x, mask: Optional[torch.Tensor] = None, attn_res: Optional[torch.Tensor] = None, batch=None,alpha=0.5):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+            attn_res: Attention residual mask
+            batch: batch size
+        
+        Return:
+            x: Output tensor
+            attn_res: Attention residual for the upcomming transformer layer
+        """
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+        attn = attn + self._get_rel_pos_bias()
+
+        #Attention propagation module
+        if attn_res is not None:
+            attn_res = attn_res.reshape(batch, 1, -1, attn_res.shape[-2], attn_res.shape[-1])
+            shape = attn.shape
+            attn = attn.reshape(batch, 1, -1, attn.shape[-2], attn.shape[-1])
+            attn_res = torch.nn.functional.interpolate(attn_res, (attn.shape[-3], shape[-2], shape[-1]))
+
+            # if attn_res.shape[1] != attn.shape[1]:
+            #     attn_res = attn_res.mean(1, keepdim=True)
+        
+
+            # attn = (0.5 * attn) + (0.5 * attn_res)
+            # 残差权重
+            attn = (alpha * attn) + ((1-alpha) * attn_res)   
+            attn = attn.view(shape)
+        attn_res = attn    
+
+        if mask is not None:
+            num_win = mask.shape[0]
+            attn = attn.view(B_ // num_win, num_win, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, -1)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x, attn_res
+
 
 try:
     import os, sys
@@ -35,7 +458,7 @@ class Mlp(nn.Module):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
+        self.act = act_layer()# 报错
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
@@ -80,112 +503,6 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 
-class WindowAttention(nn.Module):
-    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
-    It supports both of shifted and non-shifted window.
-
-    Args:
-        dim (int): Number of input channels.
-        window_size (tuple[int]): The height and width of the window.
-        num_heads (int): Number of attention heads.
-        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
-        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
-        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
-        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
-    """
-
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
-
-        super().__init__()
-        self.dim = dim
-        self.window_size = window_size  # Wh, Ww
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-
-        # define a parameter table of relative position bias
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
-
-        # get pair-wise relative position index for each token inside the window
-        coords_h = torch.arange(self.window_size[0])
-        coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
-        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
-        relative_coords[:, :, 1] += self.window_size[1] - 1
-        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-        self.register_buffer("relative_position_index", relative_position_index)
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-        trunc_normal_(self.relative_position_bias_table, std=.02)
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, x, mask=None):
-        """
-        Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
-        B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
-
-        q = q * self.scale
-        # 注意力 矩阵计算符@，这样做是为了在注意力计算时，将注意力权重与查询向量进行内积，而注意力权重是由查询向量 q 和键向量 k 的转置相乘得到的。
-        attn = (q @ k.transpose(-2, -1))
-
-        # 计算相对位置偏执
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        
-        # 最终的注意力矩阵值
-        attn = attn + relative_position_bias.unsqueeze(0)
-
-        # 是否有掩盖块
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
-
-        # 放入Dropout
-        attn = self.attn_drop(attn)
-        
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        # 全连接层
-        x = self.proj(x)
-        # Dropout
-        x = self.proj_drop(x)
-        return x
-
-    def extra_repr(self) -> str:
-        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
-
-    def flops(self, N):
-        # calculate flops for 1 window with token length of N
-        flops = 0
-        # qkv = self.qkv(x)
-        flops += N * self.dim * 3 * self.dim
-        # attn = (q @ k.transpose(-2, -1))
-        flops += self.num_heads * N * (self.dim // self.num_heads) * N
-        #  x = (attn @ v)
-        flops += self.num_heads * N * N * (self.dim // self.num_heads)
-        # x = self.proj(x)
-        flops += N * self.dim * self.dim
-        return flops
-
-
 # 基础层实体
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
@@ -207,10 +524,20 @@ class SwinTransformerBlock(nn.Module):
         fused_window_process (bool, optional): If True, use one kernel to fused window shift & window partition for acceleration, similar for the reversed part. Default: False
     """
 
-    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
-                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                #  act_layer=nn.GELU, 
-                 act_layer=nn.ReLU,
+    def __init__(self, 
+                 dim, 
+                 input_resolution, 
+                 num_heads, 
+                 window_size=7, 
+                 shift_size=0,
+                 mlp_ratio=4., 
+                 qkv_bias=True, 
+                 qk_scale=None, 
+                 head_dim = None,
+                 drop=0., 
+                 attn_drop=0., 
+                 drop_path=0.,
+                 act_layer=nn.GELU,  
                  norm_layer=nn.LayerNorm,
                  fused_window_process=False):
         super().__init__()
@@ -228,8 +555,14 @@ class SwinTransformerBlock(nn.Module):
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
-            dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            dim, 
+            num_heads=num_heads, 
+            head_dim=head_dim, 
+            window_size=to_2tuple(self.window_size),
+            qkv_bias=qkv_bias, 
+            attn_drop=attn_drop, 
+            proj_drop=drop
+            alpha = 0.5)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -261,7 +594,16 @@ class SwinTransformerBlock(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
         self.fused_window_process = fused_window_process
-
+        
+        #todo 注意力插件 用于代替FNN
+        self.CSA = CSA(
+                channels =  dim,
+                timeWindows= 1, 
+                c_ratio=16, 
+                t_ratio=1
+            )
+        
+        
     def forward(self, x):
         H, W = self.input_resolution
         B, L, C = x.shape
@@ -288,7 +630,7 @@ class SwinTransformerBlock(nn.Module):
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+        attn_windows,attn_res = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -307,8 +649,9 @@ class SwinTransformerBlock(nn.Module):
         x = shortcut + self.drop_path(x)
 
         # FFN
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-
+        # x = x + self.drop_path(self.mlp(self.norm2(x)))
+        # todo 用CSA代替FFN
+        x = x+self.CSA(x)
         return x
 
     def extra_repr(self) -> str:
@@ -479,7 +822,9 @@ class PatchEmbed(nn.Module):
         self.embed_dim = embed_dim
 
         #定义卷积层
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        # self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+        self.proj = Snn_Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         # 是否规范化
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
@@ -503,8 +848,9 @@ class PatchEmbed(nn.Module):
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops
+
 # 调用模型
-class SwinTransformer(nn.Module):
+class model_Test_Res_MS_swin(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
           https://arxiv.org/pdf/2103.14030
@@ -560,6 +906,7 @@ class SwinTransformer(nn.Module):
         patches_resolution = self.patch_embed.patches_resolution
         self.patches_resolution = patches_resolution
         
+        
         # 设置完模型参数后,对模型进行训练正则化的设置
 
         # absolute position embedding 绝对位置嵌入
@@ -597,7 +944,8 @@ class SwinTransformer(nn.Module):
 
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        # 被第二个调用的方法 多头注意力机制做一个线性变化
+        
+        # MLP分类 
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
         self.apply(self._init_weights)

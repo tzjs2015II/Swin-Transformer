@@ -8,8 +8,11 @@
 from .swin_transformer import SwinTransformer
 from .swin_transformer_v2 import SwinTransformerV2
 from .swin_transformer_moe import SwinTransformerMoE
+
+
 from .swin_mlp import SwinMLP
 from .simmim import build_simmim
+
 
 
 def build_model(config, is_pretrain=False):
@@ -44,6 +47,7 @@ def build_model(config, is_pretrain=False):
                                 depths=config.MODEL.SWIN.DEPTHS,
                                 # 多头自注意力机制中的注意头数量
                                 num_heads=config.MODEL.SWIN.NUM_HEADS,
+                                # 窗口大小
                                 window_size=config.MODEL.SWIN.WINDOW_SIZE,
                                 # MLP（多层感知机）隐藏层维度与嵌入维度之比
                                 mlp_ratio=config.MODEL.SWIN.MLP_RATIO,
@@ -128,6 +132,40 @@ def build_model(config, is_pretrain=False):
                         ape=config.MODEL.SWIN_MLP.APE,
                         patch_norm=config.MODEL.SWIN_MLP.PATCH_NORM,
                         use_checkpoint=config.TRAIN.USE_CHECKPOINT)
+    # elif model_type == 'model_Test_Res_MS_swin':
+    #     model = model_Test_Res_MS_swin(
+    #         img_size=config.DATA.IMG_SIZE,
+    #                             patch_size=config.MODEL.SWIN.PATCH_SIZE,
+    #                             # 输入通道
+    #                             in_chans=config.MODEL.SWIN.IN_CHANS,
+    #                             # 分类数
+    #                             num_classes=config.MODEL.NUM_CLASSES,
+    #                             # patch embedding 层的输出维度
+    #                             embed_dim=config.MODEL.SWIN.EMBED_DIM,
+    #                             depths=config.MODEL.SWIN.DEPTHS,
+    #                             # 多头自注意力机制中的注意头数量
+    #                             num_heads=config.MODEL.SWIN.NUM_HEADS,
+    #                             # 窗口大小
+    #                             window_size=config.MODEL.SWIN.WINDOW_SIZE,
+    #                             # MLP（多层感知机）隐藏层维度与嵌入维度之比
+    #                             mlp_ratio=config.MODEL.SWIN.MLP_RATIO,
+    #                             # 是否在查询、键、值的线性变换中使用偏置项
+    #                             qkv_bias=config.MODEL.SWIN.QKV_BIAS,
+    #                             # 查询和键的缩放因子，通常为 None 或一个浮点数
+    #                             qk_scale=config.MODEL.SWIN.QK_SCALE,
+    #                             # 全局的dropout率，用于在模型中的不同层之间引入随机性。
+    #                             drop_rate=config.MODEL.DROP_RATE,
+    #                             # 随机深度（stochastic depth）的概率，控制模型的深度。
+    #                             drop_path_rate=config.MODEL.DROP_PATH_RATE,
+    #                             # 是否在patch embedding层后添加绝对位置编码
+    #                             ape=config.MODEL.SWIN.APE,
+    #                             # 归一化
+    #                             norm_layer=layernorm,
+    #                             # 是否在patch embedding层之后进行归一化
+    #                             patch_norm=config.MODEL.SWIN.PATCH_NORM,
+    #                             use_checkpoint=config.TRAIN.USE_CHECKPOINT,
+    #                             fused_window_process=config.FUSED_WINDOW_PROCESS
+    #     )
     else:
         raise NotImplementedError(f"Unkown model: {model_type}")
 

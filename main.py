@@ -30,7 +30,7 @@ from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScale
     reduce_tensor
 import torch.distributed.launch
 
-from qcfs_transform_module import *
+
 import logging
 
 def parse_option():
@@ -91,10 +91,6 @@ def main(config):
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config) 
     
-    # Quantization level of QCFS
-    l_qcfs = 4
-    # 将rule替换qcfs函数
-    replace_activation_by_floor(model,l_qcfs)
     
     logger.info(str(model))
     
@@ -170,6 +166,7 @@ def main(config):
 
         train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler,
                         loss_scaler)
+        #如果当前进程的 rank 为 0，并且当前 epoch 是保存频率的倍数，或者当前 epoch 是最后一个训练 epoch
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler,
                             logger)
@@ -190,6 +187,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     optimizer.zero_grad()
 
     num_steps = len(data_loader)
+    
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
     # 梯度范数的平均值
@@ -254,9 +252,11 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
 @torch.no_grad()
 def validate(config, data_loader, model):
+    # 定义交叉熵损失函数，均方损失是F.mse_loss
     criterion = torch.nn.CrossEntropyLoss()
     model.eval()
-
+    
+    # 许多深度学习训练和验证脚本中常用的工具，用于计算和存储某些指标的平均值、总和和计数等信息。它可以帮助我们跟踪训练或验证过程中各种指标（如损失、精度等）的变化情况。
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
     acc1_meter = AverageMeter()
@@ -264,10 +264,11 @@ def validate(config, data_loader, model):
 
     end = time.time()
     for idx, (images, target) in enumerate(data_loader):
+        # non_blocking=True 参数允许数据传输和计算并行进行。
         images = images.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
-        # compute output
+        # compute output 自动混合精度上下文管理器 (autocast) 中计算模型输出。
         with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
             output = model(images)
 
@@ -275,6 +276,7 @@ def validate(config, data_loader, model):
         loss = criterion(output, target)
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
+        # 在多 GPU 设置下，将各 GPU 上的张量减少（汇总）到一个张量上。
         acc1 = reduce_tensor(acc1)
         acc5 = reduce_tensor(acc5)
         loss = reduce_tensor(loss)
